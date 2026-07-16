@@ -9,3 +9,7 @@ export function generateId() {
 export function logError(message) {
   console.log("Error: " + message);
 }
+
+export function isValidAmount(amount) {
+  return amount > 0;
+}

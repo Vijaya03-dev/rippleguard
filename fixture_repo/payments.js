@@ -7,3 +7,7 @@ export function processPayment(userId, amount) {
   const formatted = formatCurrency(amount);
   return { transactionId, formatted, session };
 }
+
+export function refundPayment(transactionId) {
+  return transactionId;
+}
