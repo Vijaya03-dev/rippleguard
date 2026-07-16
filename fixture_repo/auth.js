@@ -9,3 +9,6 @@ export function login(username, password) {
   const session = createSession(username);
   return session;
 }
+export function logoutSession(sessionId) {
+  return sessionId;
+}
