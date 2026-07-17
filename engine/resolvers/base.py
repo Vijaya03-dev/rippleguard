@@ -58,6 +58,29 @@ class LanguageResolver(ABC):
         pass
 
     @abstractmethod
+    def extract_function_definitions(self, ast: Any) -> List[dict]:
+        """
+        Walks the parsed AST and extracts metadata for each function defined
+        in the file: its name and the line range it spans.
+
+        WHY: The function-level call graph needs to know (a) which functions
+        exist in a file so we can resolve call targets, and (b) the line
+        boundaries of each function so we can determine which function
+        *contains* a given call expression (by checking whether the call's
+        line falls within a function's start_line..end_line range).
+
+        Args:
+            ast: The AST returned by parse_file.
+
+        Returns:
+            A list of dicts, each with:
+                - "name": str — the function/method name.
+                - "start_line": int — 1-indexed first line of the function.
+                - "end_line": int — 1-indexed last line of the function.
+        """
+        pass
+
+    @abstractmethod
     def resolve_import_to_filepath(self, import_string: str, current_filepath: str) -> Optional[str]:
         """
         Resolves a raw import string to a concrete file path on disk relative to the current file.
@@ -75,3 +98,4 @@ class LanguageResolver(ABC):
             The absolute path of the resolved file on disk as a string, or None.
         """
         pass
+

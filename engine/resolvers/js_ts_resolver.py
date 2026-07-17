@@ -114,3 +114,46 @@ class JSTSResolver(LanguageResolver):
         except Exception:
             pass
         return None
+
+    def extract_function_definitions(self, ast: Any) -> List[dict]:
+        """
+        Extract all named function definitions from a JS/TS AST.
+
+        Targets:
+          - 'function_declaration': top-level or exported named functions
+            (e.g. `function foo() {}` or `export function foo() {}`)
+          - 'method_definition': named methods inside class bodies
+            (e.g. `class Foo { bar() {} }`)
+
+        Skips arrow functions and anonymous function expressions since they
+        don't produce named definitions that other files can import/call by
+        name — keeping scope manageable for this phase.
+        """
+        definitions: List[dict] = []
+        if ast is None:
+            return definitions
+
+        nodes = self._walk(ast.root_node)
+        for node in nodes:
+            if node.type not in ('function_declaration', 'method_definition'):
+                continue
+
+            name_node = node.child_by_field_name('name')
+            if name_node is None:
+                continue
+
+            try:
+                func_name = name_node.text.decode('utf-8')
+            except Exception as e:
+                print(f"Warning: could not decode function name: {e}")
+                continue
+
+            # tree-sitter positions are 0-indexed (row, col).
+            # Convert to 1-indexed lines to match conventional line numbers.
+            definitions.append({
+                "name": func_name,
+                "start_line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1,
+            })
+
+        return definitions

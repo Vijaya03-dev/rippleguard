@@ -36,51 +36,140 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+// ─── Constants ──────────────────────────────────────────────────────────
+const API_URL = 'http://127.0.0.1:8000/api/analyze/';
+// Map from snake_case reason codes produced by the engine to readable
+// labels the user can skim in the webview.
+const REASON_CODE_LABELS = {
+    'direct_import': 'direct import',
+    'high_cochange_frequency': 'high co-change frequency',
+    'indirect_relationship': 'indirect relationship',
+};
 /**
  * activate() is called by VS Code the very first time a user triggers any
  * command registered by this extension (see "contributes.commands" in
  * package.json). It runs once per session and is where we set up all
- * command handlers and long-lived resources.
- *
- * The `context` object holds the extension's lifecycle — anything pushed
- * into `context.subscriptions` will be automatically cleaned up when the
- * extension is deactivated (e.g. when VS Code shuts down).
+ * command handlers.
  */
 function activate(context) {
     console.log('RippleGuard extension activated.');
-    // Register the "RippleGuard: Analyze Impact" command.
-    // The command ID here ('rippleguard.analyze') must exactly match the
-    // "command" field in package.json's contributes.commands — if they
-    // don't match, the command will appear in the palette but do nothing
-    // (a common and confusing failure mode).
-    const analyzeCmd = vscode.commands.registerCommand('rippleguard.analyze', () => {
-        // createWebviewPanel() opens a new tab inside VS Code with a
-        // fully controllable HTML surface (a "webview").
-        //
-        // Arguments:
-        //   1. viewType: an internal ID for this panel type (used if VS Code
-        //      needs to serialize/restore it — can be any unique string).
-        //   2. title: what appears on the tab header.
-        //   3. showOptions: which editor column to open in.
-        //      ViewColumn.One = the main/first editor column.
-        const panel = vscode.window.createWebviewPanel('rippleguardPanel', // viewType
-        'RippleGuard', // title shown on the tab
-        vscode.ViewColumn.One, // open in the primary editor column
-        {} // webview options (empty for now)
-        );
-        // Set the HTML content of the webview. In this phase, it's a
-        // hardcoded string just to prove the panel renders. Phase 8 will
-        // replace this with real UI that displays analysis results.
-        panel.webview.html = getWebviewContent();
+    const analyzeCmd = vscode.commands.registerCommand('rippleguard.analyze', async () => {
+        // --- 1. Get the active file path ---
+        // vscode.window.activeTextEditor is undefined if no editor tab is
+        // focused (e.g. the user has the terminal or settings tab open).
+        const activeEditor = vscode.window.activeTextEditor;
+        if (!activeEditor) {
+            vscode.window.showErrorMessage('RippleGuard: No active file. Open a file in the editor first.');
+            return;
+        }
+        const changedFile = activeEditor.document.uri.fsPath;
+        // --- 2. Get the workspace folder path (used as repo_path) ---
+        // workspaceFolders is undefined when VS Code is opened with no
+        // folder — just a loose file. The API needs a directory to scan.
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            vscode.window.showErrorMessage('RippleGuard: No workspace folder open. Use File > Open Folder first.');
+            return;
+        }
+        const repoPath = workspaceFolders[0].uri.fsPath;
+        // --- 3. Open the webview panel immediately with a loading state ---
+        // We show "Analyzing…" right away so the user knows the extension
+        // is working, then update the HTML once the API responds.
+        const panel = vscode.window.createWebviewPanel('rippleguardPanel', 'RippleGuard', vscode.ViewColumn.One, {});
+        panel.webview.html = getWebviewContent({
+            state: 'loading',
+            changedFile: changedFile,
+        });
+        // --- 4. Call the Django API ---
+        try {
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    repo_path: repoPath,
+                    changed_file: changedFile,
+                }),
+            });
+            // The API returns JSON in all cases (200, 400, 500).
+            const body = await response.json();
+            if (!response.ok) {
+                // Non-2xx: the API returned an error object { error: "..." }.
+                const errorMsg = ('error' in body) ? body.error : `HTTP ${response.status}`;
+                panel.webview.html = getWebviewContent({
+                    state: 'error',
+                    changedFile: changedFile,
+                    errorMessage: errorMsg,
+                });
+                return;
+            }
+            // --- 5. Success: render the results ---
+            const result = body;
+            panel.webview.html = getWebviewContent({
+                state: 'success',
+                changedFile: changedFile,
+                result: result,
+            });
+        }
+        catch (err) {
+            // --- 6. Network-level failure (server not running, DNS, etc.) ---
+            const message = (err instanceof Error) ? err.message : String(err);
+            panel.webview.html = getWebviewContent({
+                state: 'error',
+                changedFile: changedFile,
+                errorMessage: `Could not reach the RippleGuard API at ${API_URL}. ` +
+                    `Is the Django server running?\n\nDetails: ${message}`,
+            });
+        }
     });
     context.subscriptions.push(analyzeCmd);
 }
-/**
- * Returns the full HTML string for the webview panel.
- * Extracted into its own function so it's easy to replace in Phase 8
- * without touching the command registration boilerplate.
- */
-function getWebviewContent() {
+function getWebviewContent(data) {
+    let bodyHtml;
+    switch (data.state) {
+        case 'loading':
+            bodyHtml = `
+				<h1>RippleGuard</h1>
+				<p>Analyzing impact of: <strong>${escapeHtml(path.basename(data.changedFile))}</strong></p>
+				<p><em>Contacting API…</em></p>`;
+            break;
+        case 'error':
+            bodyHtml = `
+				<h1>RippleGuard — Error</h1>
+				<p>File: <strong>${escapeHtml(path.basename(data.changedFile))}</strong></p>
+				<p style="color: #e74c3c; white-space: pre-wrap;">${escapeHtml(data.errorMessage)}</p>`;
+            break;
+        case 'success': {
+            const affected = data.result.affected_files;
+            if (affected.length === 0) {
+                bodyHtml = `
+					<h1>RippleGuard</h1>
+					<p>File: <strong>${escapeHtml(path.basename(data.changedFile))}</strong></p>
+					<p>No files are significantly affected by this change.</p>`;
+            }
+            else {
+                const listItems = affected.map(f => {
+                    // Convert the affected_file absolute path to just the filename.
+                    const filename = path.basename(f.affected_file);
+                    // Convert snake_case reason codes to readable labels.
+                    const reasons = f.severity_reason_codes
+                        .map(code => REASON_CODE_LABELS[code] ?? code.replace(/_/g, ' '))
+                        .join(', ');
+                    return `<li>
+						<strong>${escapeHtml(filename)}</strong>
+						— severity: ${f.severity_score.toFixed(2)}
+						— reasons: ${escapeHtml(reasons)}
+					</li>`;
+                }).join('\n');
+                bodyHtml = `
+					<h1>RippleGuard</h1>
+					<p>Impact analysis for: <strong>${escapeHtml(path.basename(data.changedFile))}</strong></p>
+					<p>${affected.length} file(s) may be affected:</p>
+					<ul>${listItems}</ul>`;
+            }
+            break;
+        }
+    }
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -89,14 +178,21 @@ function getWebviewContent() {
 	<title>RippleGuard</title>
 </head>
 <body>
-	<h1>RippleGuard is working</h1>
+	${bodyHtml}
 </body>
 </html>`;
 }
 /**
- * deactivate() is called when the extension is unloaded (VS Code shutdown,
- * extension disabled, etc.). Nothing to clean up in this phase — anything
- * in context.subscriptions is disposed automatically.
+ * Minimal HTML escaping to prevent accidental injection of file paths
+ * or error messages that contain angle brackets, ampersands, or quotes.
  */
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+/** Called when the extension is deactivated. Nothing to clean up. */
 function deactivate() { }
 //# sourceMappingURL=extension.js.map
