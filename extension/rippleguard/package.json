@@ -14,8 +14,8 @@
   "contributes": {
     "commands": [
       {
-        "command": "rippleguard.helloWorld",
-        "title": "Hello World"
+        "command": "rippleguard.analyze",
+        "title": "RippleGuard: Analyze Impact"
       }
     ]
   },
