@@ -5,6 +5,9 @@ from engine.cochange_miner import get_cochange_frequencies
 from engine.scoring import compute_severity_score
 
 
+from engine.groq_client import get_explanation
+
+
 # Minimum severity score to include a file in the output.  Anything below
 # this is near-zero noise — files with no graph connection AND no co-change
 # history.  0.1 filters those out while keeping anything with at least a
@@ -149,11 +152,17 @@ def analyze_change(repo_path: str, changed_file: str) -> dict:
         if score < _SEVERITY_THRESHOLD:
             continue
 
+        explanation = get_explanation(
+            reason_codes=reason_codes,
+            changed_name=os.path.basename(changed_file),
+            affected_name=os.path.basename(node)
+        )
+
         affected_files.append({
             "affected_file": node,
             "severity_score": score,
             "severity_reason_codes": reason_codes,
-            "plain_english_explanation": None,
+            "plain_english_explanation": explanation,
         })
 
     # Sort by severity_score descending so the most critical files appear first.
