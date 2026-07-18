@@ -38,7 +38,8 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 // ─── Constants ──────────────────────────────────────────────────────────
-const API_URL = 'http://127.0.0.1:8000/api/analyze/';
+const FILE_API_URL = 'http://127.0.0.1:8000/api/analyze/';
+const FUNCTION_API_URL = 'http://127.0.0.1:8000/api/analyze-function/';
 // Map from snake_case reason codes produced by the engine to readable
 // labels the user can skim in the webview.
 const REASON_CODE_LABELS = {
@@ -46,44 +47,43 @@ const REASON_CODE_LABELS = {
     'high_cochange_frequency': 'high co-change frequency',
     'indirect_relationship': 'indirect relationship',
 };
+// ─── On-save state ──────────────────────────────────────────────────────
+// Tracks the content of each JS/TS file as of the last successful save
+// analysis. The first time a file is saved we have no "old" version to
+// diff against, so we just cache the content silently and wait for the
+// next save.
+const lastSavedContent = new Map();
 /**
  * activate() is called by VS Code the very first time a user triggers any
  * command registered by this extension (see "contributes.commands" in
- * package.json). It runs once per session and is where we set up all
- * command handlers.
+ * package.json), OR when a JS/TS file is opened (see "activationEvents"
+ * in package.json). It runs once per session and is where we set up all
+ * command handlers and event listeners.
  */
 function activate(context) {
     console.log('RippleGuard extension activated.');
+    // ─── Manual command: file-level analysis (Webview) ──────────────
+    // Unchanged from Phase 8. Triggered via Ctrl+Shift+P > "RippleGuard: Analyze Impact".
     const analyzeCmd = vscode.commands.registerCommand('rippleguard.analyze', async () => {
-        // --- 1. Get the active file path ---
-        // vscode.window.activeTextEditor is undefined if no editor tab is
-        // focused (e.g. the user has the terminal or settings tab open).
         const activeEditor = vscode.window.activeTextEditor;
         if (!activeEditor) {
             vscode.window.showErrorMessage('RippleGuard: No active file. Open a file in the editor first.');
             return;
         }
         const changedFile = activeEditor.document.uri.fsPath;
-        // --- 2. Get the workspace folder path (used as repo_path) ---
-        // workspaceFolders is undefined when VS Code is opened with no
-        // folder — just a loose file. The API needs a directory to scan.
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
             vscode.window.showErrorMessage('RippleGuard: No workspace folder open. Use File > Open Folder first.');
             return;
         }
         const repoPath = workspaceFolders[0].uri.fsPath;
-        // --- 3. Open the webview panel immediately with a loading state ---
-        // We show "Analyzing…" right away so the user knows the extension
-        // is working, then update the HTML once the API responds.
         const panel = vscode.window.createWebviewPanel('rippleguardPanel', 'RippleGuard', vscode.ViewColumn.One, {});
         panel.webview.html = getWebviewContent({
             state: 'loading',
             changedFile: changedFile,
         });
-        // --- 4. Call the Django API ---
         try {
-            const response = await fetch(API_URL, {
+            const response = await fetch(FILE_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -91,10 +91,8 @@ function activate(context) {
                     changed_file: changedFile,
                 }),
             });
-            // The API returns JSON in all cases (200, 400, 500).
             const body = await response.json();
             if (!response.ok) {
-                // Non-2xx: the API returned an error object { error: "..." }.
                 const errorMsg = ('error' in body) ? body.error : `HTTP ${response.status}`;
                 panel.webview.html = getWebviewContent({
                     state: 'error',
@@ -103,7 +101,6 @@ function activate(context) {
                 });
                 return;
             }
-            // --- 5. Success: render the results ---
             const result = body;
             panel.webview.html = getWebviewContent({
                 state: 'success',
@@ -112,17 +109,101 @@ function activate(context) {
             });
         }
         catch (err) {
-            // --- 6. Network-level failure (server not running, DNS, etc.) ---
             const message = (err instanceof Error) ? err.message : String(err);
             panel.webview.html = getWebviewContent({
                 state: 'error',
                 changedFile: changedFile,
-                errorMessage: `Could not reach the RippleGuard API at ${API_URL}. ` +
+                errorMessage: `Could not reach the RippleGuard API at ${FILE_API_URL}. ` +
                     `Is the Django server running?\n\nDetails: ${message}`,
             });
         }
     });
     context.subscriptions.push(analyzeCmd);
+    // ─── Automatic on-save: function-level analysis (notification) ──
+    //
+    // WHY notifications instead of a Webview panel:
+    //   This fires on every save — opening a full Webview tab each time
+    //   would be massively disruptive.  A small, transient notification
+    //   in the bottom-right corner is the appropriate UX for automatic,
+    //   frequent, background feedback.  The user glances at it and
+    //   continues working; it auto-dismisses after a few seconds.
+    //
+    // WHY failures are silent (console.log only, no error popup):
+    //   Unlike the manual command (where the user deliberately asked
+    //   for analysis and expects a result or a clear error), this fires
+    //   automatically on every save.  If the Django server is down, an
+    //   error popup on every Ctrl+S would be far more annoying than the
+    //   original problem.  We log to the Debug Console so it's still
+    //   diagnosable when needed, but never interrupt the user's flow.
+    const onSaveListener = vscode.workspace.onDidSaveTextDocument(async (document) => {
+        // Only analyze JS/TS files — skip everything else.
+        if (document.languageId !== 'javascript' && document.languageId !== 'typescript') {
+            return;
+        }
+        const filePath = document.uri.fsPath;
+        const newContent = document.getText();
+        // First save of this file in the session: cache it and skip.
+        // We have no "old" version to diff against yet.
+        const oldContent = lastSavedContent.get(filePath);
+        if (oldContent === undefined) {
+            lastSavedContent.set(filePath, newContent);
+            console.log(`RippleGuard: First save of ${path.basename(filePath)}, cached for future diffs.`);
+            return;
+        }
+        // Content unchanged — no point calling the API.
+        if (oldContent === newContent) {
+            return;
+        }
+        // Get workspace folder for repo_path.
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            console.log('RippleGuard on-save: No workspace folder open, skipping analysis.');
+            return;
+        }
+        const repoPath = workspaceFolders[0].uri.fsPath;
+        try {
+            const response = await fetch(FUNCTION_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    repo_path: repoPath,
+                    filepath: filePath,
+                    old_content: oldContent,
+                    new_content: newContent,
+                }),
+            });
+            const body = await response.json();
+            if (!response.ok) {
+                const errorMsg = ('error' in body) ? body.error : `HTTP ${response.status}`;
+                console.log(`RippleGuard on-save: API returned error: ${errorMsg}`);
+                // Update cache regardless so next save diffs correctly.
+                lastSavedContent.set(filePath, newContent);
+                return;
+            }
+            const result = body;
+            // Only show a notification if there are actual affected functions.
+            // Don't spam the user when nothing is impacted.
+            if (result.changed_functions.length > 0 && result.affected_functions.length > 0) {
+                const changedNames = result.changed_functions
+                    .map(name => `${name}()`)
+                    .join(', ');
+                const affectedNames = result.affected_functions
+                    .map(af => `${af.function_name}()`)
+                    .join(', ');
+                vscode.window.showInformationMessage(`RippleGuard: Changing ${changedNames} may affect: ${affectedNames}`);
+            }
+        }
+        catch (err) {
+            // Silent failure — log only, never show an error popup on
+            // automatic saves. See the WHY comment above.
+            const message = (err instanceof Error) ? err.message : String(err);
+            console.log(`RippleGuard on-save: API unreachable — ${message}`);
+        }
+        // Always update the cache after analysis (success or failure)
+        // so the next save diffs against the correct baseline.
+        lastSavedContent.set(filePath, newContent);
+    });
+    context.subscriptions.push(onSaveListener);
 }
 function getWebviewContent(data) {
     let bodyHtml;
@@ -149,9 +230,7 @@ function getWebviewContent(data) {
             }
             else {
                 const listItems = affected.map(f => {
-                    // Convert the affected_file absolute path to just the filename.
                     const filename = path.basename(f.affected_file);
-                    // Convert snake_case reason codes to readable labels.
                     const reasons = f.severity_reason_codes
                         .map(code => REASON_CODE_LABELS[code] ?? code.replace(/_/g, ' '))
                         .join(', ');
@@ -182,10 +261,6 @@ function getWebviewContent(data) {
 </body>
 </html>`;
 }
-/**
- * Minimal HTML escaping to prevent accidental injection of file paths
- * or error messages that contain angle brackets, ampersands, or quotes.
- */
 function escapeHtml(text) {
     return text
         .replace(/&/g, '&amp;')
