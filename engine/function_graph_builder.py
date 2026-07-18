@@ -1,6 +1,8 @@
 import os
+import ast
 import networkx as nx
 from engine.resolvers.js_ts_resolver import JSTSResolver
+from engine.resolvers.python_resolver import PythonResolver
 
 
 def build_function_graph(repo_path: str) -> nx.DiGraph:
@@ -17,15 +19,16 @@ def build_function_graph(repo_path: str) -> nx.DiGraph:
         A networkx DiGraph with "filepath::function_name" string nodes.
     """
     graph = nx.DiGraph()
-    resolver = JSTSResolver()
+    js_resolver = JSTSResolver()
+    py_resolver = PythonResolver()
 
-    # --- 1. Discover all JS/TS files ---
+    # --- 1. Discover all JS/TS/Python files ---
     target_files: list[str] = []
     for root, _, files in os.walk(repo_path):
         if 'node_modules' in root or '/.' in root or '\\.' in root:
             continue
         for file in files:
-            if file.endswith(('.js', '.jsx', '.ts', '.tsx')):
+            if file.endswith(('.js', '.jsx', '.ts', '.tsx', '.py')):
                 target_files.append(os.path.join(root, file))
 
     # --- 2. Parse every file and collect function definitions ---
@@ -36,11 +39,14 @@ def build_function_graph(repo_path: str) -> nx.DiGraph:
     file_asts: dict[str, object] = {}
 
     for filepath in target_files:
-        ast = resolver.parse_file(filepath)
-        if ast is None:
+        ext = os.path.splitext(filepath)[1].lower()
+        resolver = py_resolver if ext == '.py' else js_resolver
+
+        ast_tree = resolver.parse_file(filepath)
+        if ast_tree is None:
             continue
-        file_asts[filepath] = ast
-        defs = resolver.extract_function_definitions(ast)
+        file_asts[filepath] = ast_tree
+        defs = resolver.extract_function_definitions(ast_tree)
         file_defs[filepath] = defs
 
         # Add every function as a graph node, even if it has no edges.
@@ -49,14 +55,17 @@ def build_function_graph(repo_path: str) -> nx.DiGraph:
 
     # --- 3. For each file, resolve function calls to their targets ---
     for filepath in target_files:
-        ast = file_asts.get(filepath)
-        if ast is None:
+        ext = os.path.splitext(filepath)[1].lower()
+        resolver = py_resolver if ext == '.py' else js_resolver
+
+        ast_tree = file_asts.get(filepath)
+        if ast_tree is None:
             continue
 
         defs_in_file = file_defs.get(filepath, [])
 
         # Resolve this file's imports to absolute paths.
-        raw_imports = resolver.extract_imports(ast)
+        raw_imports = resolver.extract_imports(ast_tree)
         imported_filepaths: list[str] = []
         for imp in raw_imports:
             resolved = resolver.resolve_import_to_filepath(imp, filepath)
@@ -68,7 +77,10 @@ def build_function_graph(repo_path: str) -> nx.DiGraph:
         # extract_function_calls method returns only names (no positions),
         # and we must not modify it.  We need the line number of each call
         # so we can determine which enclosing function contains it.
-        positioned_calls = _extract_positioned_calls(ast, resolver)
+        if ext == '.py':
+            positioned_calls = _extract_positioned_calls_python(ast_tree)
+        else:
+            positioned_calls = _extract_positioned_calls(ast_tree, resolver)
 
         for call_name, call_line in positioned_calls:
             # Determine which function in THIS file contains this call.
@@ -99,6 +111,33 @@ def build_function_graph(repo_path: str) -> nx.DiGraph:
 
 
 # ─── Helper functions ────────────────────────────────────────────────────
+
+def _extract_positioned_calls_python(ast_tree: object) -> list[tuple[str, int]]:
+    """
+    Walk the Python AST and return (call_name, 1-indexed_line) for every
+    Call node.
+    """
+    calls: list[tuple[str, int]] = []
+    if not isinstance(ast_tree, ast.AST):
+        return calls
+
+    def get_call_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            val = get_call_name(node.value)
+            if val:
+                return f"{val}.{node.attr}"
+        return None
+
+    for node in ast.walk(ast_tree):
+        if isinstance(node, ast.Call):
+            name = get_call_name(node.func)
+            if name:
+                line = getattr(node, 'lineno', 1)
+                calls.append((name, line))
+    return calls
+
 
 def _extract_positioned_calls(ast: object, resolver: JSTSResolver) -> list[tuple[str, int]]:
     """

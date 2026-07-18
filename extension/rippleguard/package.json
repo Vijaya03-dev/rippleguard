@@ -11,7 +11,8 @@
   ],
   "activationEvents": [
     "onLanguage:javascript",
-    "onLanguage:typescript"
+    "onLanguage:typescript",
+    "onView:rippleguard.historyView"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -20,7 +21,25 @@
         "command": "rippleguard.analyze",
         "title": "RippleGuard: Analyze Impact"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "rippleguard-sidebar",
+          "title": "RippleGuard",
+          "icon": "media/rippleguard-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "rippleguard-sidebar": [
+        {
+          "id": "rippleguard.historyView",
+          "name": "Impact History",
+          "type": "webview"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

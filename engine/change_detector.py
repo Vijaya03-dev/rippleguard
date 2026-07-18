@@ -34,13 +34,20 @@ def detect_changed_functions(
         never under-reports (a real logic change is always caught), which
         is the safer direction for a risk-detection tool.
     """
-    # --- Parse both versions into ASTs ---
-    parser = _get_parser(filepath)
-    old_ast = _parse_content(parser, old_content)
-    new_ast = _parse_content(parser, new_content)
+    import os
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.py':
+        from engine.resolvers.python_resolver import PythonResolver
+        resolver = PythonResolver()
+        old_ast = resolver.parse_content(old_content)
+        new_ast = resolver.parse_content(new_content)
+    else:
+        parser = _get_parser(filepath)
+        old_ast = _parse_content(parser, old_content)
+        new_ast = _parse_content(parser, new_content)
+        resolver = JSTSResolver()
 
     # --- Extract function definitions from both ---
-    resolver = JSTSResolver()
     old_defs = resolver.extract_function_definitions(old_ast)
     new_defs = resolver.extract_function_definitions(new_ast)
 

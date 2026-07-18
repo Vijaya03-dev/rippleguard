@@ -53,6 +53,7 @@ const REASON_CODE_LABELS = {
 // diff against, so we just cache the content silently and wait for the
 // next save.
 const lastSavedContent = new Map();
+const sessionHistory = [];
 /**
  * activate() is called by VS Code the very first time a user triggers any
  * command registered by this extension (see "contributes.commands" in
@@ -62,6 +63,9 @@ const lastSavedContent = new Map();
  */
 function activate(context) {
     console.log('RippleGuard extension activated.');
+    // ─── Sidebar: Impact History panel ─────────────────────────────
+    const historyProvider = new RippleGuardHistoryProvider();
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider('rippleguard.historyView', historyProvider));
     // ─── Manual command: file-level analysis (Webview) ──────────────
     // Unchanged from Phase 8. Triggered via Ctrl+Shift+P > "RippleGuard: Analyze Impact".
     const analyzeCmd = vscode.commands.registerCommand('rippleguard.analyze', async () => {
@@ -185,12 +189,34 @@ function activate(context) {
             // Don't spam the user when nothing is impacted.
             if (result.changed_functions.length > 0 && result.affected_functions.length > 0) {
                 const changedNames = result.changed_functions
-                    .map(name => `${name}()`)
+                    .map(name => `${name}() (${path.basename(filePath)})`)
                     .join(', ');
                 const affectedNames = result.affected_functions
-                    .map(af => `${af.function_name}()`)
+                    .map(af => `${af.function_name}() in ${path.basename(af.file)}`)
                     .join(', ');
                 vscode.window.showInformationMessage(`RippleGuard: Changing ${changedNames} may affect: ${affectedNames}`);
+                // ── Push to sidebar history (deduplicate consecutive identical entries) ──
+                const newAffected = result.affected_functions.map(af => ({
+                    name: `${af.function_name}()`,
+                    file: path.basename(af.file),
+                }));
+                const lastEntry = sessionHistory[sessionHistory.length - 1];
+                const isDuplicate = lastEntry !== undefined
+                    && lastEntry.changedNames === changedNames
+                    && lastEntry.affectedFunctions.length === newAffected.length
+                    && lastEntry.affectedFunctions.every((af, i) => af.name === newAffected[i].name && af.file === newAffected[i].file);
+                if (isDuplicate) {
+                    lastEntry.timestamp = new Date().toLocaleTimeString();
+                }
+                else {
+                    sessionHistory.push({
+                        timestamp: new Date().toLocaleTimeString(),
+                        changedNames,
+                        changedFile: path.basename(filePath),
+                        affectedFunctions: newAffected,
+                    });
+                }
+                historyProvider.refresh();
             }
         }
         catch (err) {
@@ -267,6 +293,135 @@ function escapeHtml(text) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+}
+// ─── Sidebar WebviewViewProvider (Impact History) ───────────────────────
+class RippleGuardHistoryProvider {
+    _view;
+    resolveWebviewView(webviewView) {
+        this._view = webviewView;
+        webviewView.webview.options = { enableScripts: true };
+        this._render();
+        // Re-render when the view becomes visible again (e.g. user
+        // switches back to the RippleGuard sidebar tab) so it picks
+        // up any entries added while it was hidden.
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                this._render();
+            }
+        });
+    }
+    /** Called by the on-save handler whenever a new entry is pushed. */
+    refresh() {
+        if (this._view?.visible) {
+            this._render();
+        }
+    }
+    _render() {
+        if (!this._view) {
+            return;
+        }
+        let entriesHtml;
+        if (sessionHistory.length === 0) {
+            entriesHtml = '<p class="empty">No impact events recorded yet. Save a JS/TS file to trigger analysis.</p>';
+        }
+        else {
+            // Render newest-first.
+            entriesHtml = [...sessionHistory].reverse().map((entry, idx) => {
+                const affectedItems = entry.affectedFunctions
+                    .map(af => `<li>${escapeHtml(af.name)} <span class="file">in ${escapeHtml(af.file)}</span></li>`)
+                    .join('\n');
+                return `<div class="entry" data-index="${idx}">
+					<div class="timestamp">${escapeHtml(entry.timestamp)}</div>
+					<div class="changed">Changed: <strong>${escapeHtml(entry.changedNames)}</strong></div>
+					<ul class="affected">${affectedItems}</ul>
+				</div>`;
+            }).join('\n');
+        }
+        this._view.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Impact History</title>
+	<style>
+		* { box-sizing: border-box; margin: 0; padding: 0; }
+		body {
+			font-family: var(--vscode-font-family, system-ui, sans-serif);
+			font-size: var(--vscode-font-size, 13px);
+			color: var(--vscode-foreground);
+			background: var(--vscode-sideBar-background);
+			padding: 8px;
+		}
+		#search {
+			width: 100%;
+			padding: 6px 8px;
+			margin-bottom: 10px;
+			border: 1px solid var(--vscode-input-border, #3c3c3c);
+			background: var(--vscode-input-background, #1e1e1e);
+			color: var(--vscode-input-foreground, #ccc);
+			border-radius: 3px;
+			outline: none;
+		}
+		#search:focus {
+			border-color: var(--vscode-focusBorder, #007acc);
+		}
+		.empty {
+			color: var(--vscode-descriptionForeground, #888);
+			font-style: italic;
+			padding: 12px 0;
+		}
+		.entry {
+			border-bottom: 1px solid var(--vscode-panel-border, #2d2d2d);
+			padding: 8px 0;
+		}
+		.entry:last-child { border-bottom: none; }
+		.timestamp {
+			font-size: 0.85em;
+			color: var(--vscode-descriptionForeground, #888);
+			margin-bottom: 2px;
+		}
+		.changed { margin-bottom: 4px; }
+		.affected {
+			list-style: none;
+			padding-left: 12px;
+		}
+		.affected li {
+			padding: 1px 0;
+		}
+		.affected li::before {
+			content: "→ ";
+			color: var(--vscode-descriptionForeground, #888);
+		}
+		.file {
+			color: var(--vscode-descriptionForeground, #888);
+		}
+		.hidden { display: none; }
+	</style>
+</head>
+<body>
+	<input type="text" id="search" placeholder="Filter by function or file name…" />
+	<div id="entries">${entriesHtml}</div>
+	<script>
+		(function() {
+			const searchInput = document.getElementById('search');
+			const entriesContainer = document.getElementById('entries');
+			searchInput.addEventListener('input', function() {
+				const query = this.value.toLowerCase();
+				const entries = entriesContainer.querySelectorAll('.entry');
+				entries.forEach(function(entry) {
+					const text = entry.textContent.toLowerCase();
+					if (query === '' || text.indexOf(query) !== -1) {
+						entry.classList.remove('hidden');
+					} else {
+						entry.classList.add('hidden');
+					}
+				});
+			});
+		})();
+	</script>
+</body>
+</html>`;
+    }
 }
 /** Called when the extension is deactivated. Nothing to clean up. */
 function deactivate() { }

@@ -1,6 +1,7 @@
 import os
 import networkx as nx
 from engine.resolvers.js_ts_resolver import JSTSResolver
+from engine.resolvers.python_resolver import PythonResolver
 
 # WHY: This module orchestrates the repository scanning. It walks the directory, 
 # uses our LanguageResolver to parse imports, and uses networkx to build a DiGraph (Directed Graph).
@@ -10,16 +11,17 @@ def build_dependency_graph(repo_path: str) -> nx.DiGraph:
     Scans a repository and builds a directed graph of file dependencies.
     """
     graph = nx.DiGraph()
-    resolver = JSTSResolver()
+    js_resolver = JSTSResolver()
+    py_resolver = PythonResolver()
 
-    # 1. Find all JS/TS files in the repo
+    # 1. Find all JS/TS/Python files in the repo
     target_files = []
     for root, _, files in os.walk(repo_path):
         # Skip node_modules or hidden folders
         if 'node_modules' in root or '/.' in root or '\\.' in root:
             continue
         for file in files:
-            if file.endswith(('.js', '.jsx', '.ts', '.tsx')):
+            if file.endswith(('.js', '.jsx', '.ts', '.tsx', '.py')):
                 target_files.append(os.path.join(root, file))
 
     # 2. Add all files as nodes first (even if they have no dependencies)
@@ -28,6 +30,9 @@ def build_dependency_graph(repo_path: str) -> nx.DiGraph:
 
     # 3. Parse each file and build the edges
     for filepath in target_files:
+        ext = os.path.splitext(filepath)[1].lower()
+        resolver = py_resolver if ext == '.py' else js_resolver
+
         ast = resolver.parse_file(filepath)
         if ast is None:
             continue
