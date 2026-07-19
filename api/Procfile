@@ -1,0 +1,1 @@
+web: gunicorn rippleguard_api.wsgi
