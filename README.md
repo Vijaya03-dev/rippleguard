@@ -248,6 +248,4 @@ Built under real time constraints, with a strict working process maintained thro
 
 ---
 
-## License
 
-*(Add your chosen license here — e.g. MIT.)*
